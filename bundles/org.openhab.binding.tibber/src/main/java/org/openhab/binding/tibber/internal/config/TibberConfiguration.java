@@ -18,9 +18,9 @@ package org.openhab.binding.tibber.internal.config;
  * @author Stian Kjoglum - Initial contribution
  */
 public class TibberConfiguration {
-    public String token;
-    public String homeid;
-    public int refresh;
+    private String token;
+    private String homeid;
+    private int refresh;
 
     public String getToken() {
         return token;

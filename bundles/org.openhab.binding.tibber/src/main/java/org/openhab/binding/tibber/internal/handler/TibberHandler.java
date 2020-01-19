@@ -33,7 +33,9 @@ import org.eclipse.jetty.websocket.api.annotations.WebSocket;
 import org.eclipse.jetty.websocket.client.ClientUpgradeRequest;
 import org.eclipse.jetty.websocket.client.WebSocketClient;
 import org.eclipse.smarthome.core.library.types.DecimalType;
+import org.eclipse.smarthome.core.library.types.QuantityType;
 import org.eclipse.smarthome.core.library.types.StringType;
+import org.eclipse.smarthome.core.library.unit.SmartHomeUnits;
 import org.eclipse.smarthome.core.thing.ChannelUID;
 import org.eclipse.smarthome.core.thing.Thing;
 import org.eclipse.smarthome.core.thing.ThingStatus;
@@ -41,8 +43,10 @@ import org.eclipse.smarthome.core.thing.ThingStatusDetail;
 import org.eclipse.smarthome.core.thing.ThingStatusInfo;
 import org.eclipse.smarthome.core.thing.binding.BaseThingHandler;
 import org.eclipse.smarthome.core.types.Command;
+import org.eclipse.smarthome.core.types.RefreshType;
 import org.eclipse.smarthome.io.net.http.HttpUtil;
 import org.openhab.binding.tibber.internal.config.TibberConfiguration;
+import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.google.gson.JsonObject;
@@ -57,10 +61,10 @@ import com.google.gson.JsonSyntaxException;
 
 public class TibberHandler extends BaseThingHandler {
     private static final int REQUEST_TIMEOUT = (int) TimeUnit.SECONDS.toMillis(20);
-    private org.slf4j.Logger logger = LoggerFactory.getLogger(TibberHandler.class);
+    private Logger logger = LoggerFactory.getLogger(TibberHandler.class);
     private final Properties httpHeader = new Properties();
+    private SslContextFactory sslContextFactory = new SslContextFactory(true);
     private WebSocketClient client;
-    private SslContextFactory sslContextFactory;
     private TibberWebSocketListener socket;
     private Session session;
     private ClientUpgradeRequest request;
@@ -83,8 +87,28 @@ public class TibberHandler extends BaseThingHandler {
         logger.info("Initializing Tibber API");
         updateStatus(ThingStatus.UNKNOWN);
 
+        configuration = getConfigAs(TibberConfiguration.class);
+        getTibberParameters();
+        startRefresh(configuration.getRefresh());
+    }
+
+    @Override
+    public void handleCommand(ChannelUID channelUID, Command command) {
+
+        if (command instanceof RefreshType) {
+            try {
+                updateRequest();
+            } catch (IOException e) {
+                updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.COMMUNICATION_ERROR, e.getMessage());
+            }
+        } else {
+            logger.debug("Tibber API is read-only and does not handle commands");
+        }
+        return;
+    }
+
+    public void getTibberParameters() {
         try {
-            configuration = getConfigAs(TibberConfiguration.class);
             String token = new StringBuilder("Bearer ").append(configuration.getToken()).toString();
             httpHeader.put("Authorization", token);
 
@@ -107,30 +131,24 @@ public class TibberHandler extends BaseThingHandler {
                 JsonObject Object = (JsonObject) new JsonParser().parse(jsonResponse);
                 rtEnabled = Object.getAsJsonObject("data").getAsJsonObject("viewer").getAsJsonObject("home")
                         .getAsJsonObject("features").get("realTimeConsumptionEnabled").toString();
-                if (rtEnabled.equals("true")) {
+
+                if ("true".equals(rtEnabled)) {
                     logger.info("Pulse associated with HomeId: Live stream will be started");
                     try {
                         open();
                     } catch (Exception e) {
-                        logger.error("Exception: {}", e);
+                        logger.warn("Websocket Exception: ", e);
                     }
                 } else {
                     logger.info("No Pulse associated with HomeId: No live stream will be started");
                 }
-                startRefresh(configuration.getRefresh());
             } else {
                 updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.CONFIGURATION_ERROR, "Incorrect token/homeid");
-                return;
             }
 
         } catch (IOException | JsonSyntaxException e) {
             updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.COMMUNICATION_ERROR, e.getMessage());
         }
-    }
-
-    @Override
-    public void handleCommand(ChannelUID channelUID, Command command) {
-        logger.debug("Tibber API is read-only and does not handle commands");
         return;
     }
 
@@ -145,32 +163,24 @@ public class TibberHandler extends BaseThingHandler {
                 JsonObject myObject = Object.getAsJsonObject("data").getAsJsonObject("viewer").getAsJsonObject("home")
                         .getAsJsonObject("currentSubscription").getAsJsonObject("priceInfo").getAsJsonObject("current");
 
-                String Total = myObject.get("total").toString();
-                BigDecimal currentTotal = new BigDecimal(Total);
+                updateState(CURRENT_TOTAL, new DecimalType(myObject.get("total").toString()));
+                updateState(CURRENT_STARTSAT, new StringType(myObject.get("startsAt").toString()));
 
-                String startsAt = myObject.get("startsAt").toString();
-
-                updateState(CURRENT_TOTAL, new DecimalType(currentTotal));
-                updateState(CURRENT_STARTSAT, new StringType(startsAt));
-
-                if (getThing().getStatus() != ThingStatus.ONLINE) {
+                if (getThing().getStatus() == ThingStatus.OFFLINE
+                        || getThing().getStatus() == ThingStatus.INITIALIZING) {
                     updateStatus(ThingStatus.ONLINE);
                 }
-
-                return;
-
             } catch (JsonSyntaxException e) {
-                logger.error("JsonException: {}", e);
+                updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.COMMUNICATION_ERROR,
+                        "Error communicating with Tibber API");
             }
         } else if (jsonResponse.contains("error")) {
             updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.COMMUNICATION_ERROR,
-                    "Error communicating with Tibber API");
-            return;
-
+                    "Error in response from Tibber API");
         } else {
-            logger.debug("Unexpected response from Tibber: {}", jsonResponse);
-            return;
+            updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.COMMUNICATION_ERROR, "Unexpected response from Tibber");
         }
+        return;
     }
 
     public void getURLDaily(String url) throws IOException {
@@ -184,31 +194,24 @@ public class TibberHandler extends BaseThingHandler {
                 JsonObject myObject = (JsonObject) Object.getAsJsonObject("data").getAsJsonObject("viewer")
                         .getAsJsonObject("home").getAsJsonObject("daily").getAsJsonArray("nodes").get(0);
 
-                String dailyFrom = myObject.get("from").toString();
-                String dailyTo = myObject.get("to").toString();
-                updateState(DAILY_FROM, new StringType(dailyFrom));
-                updateState(DAILY_TO, new StringType(dailyTo));
+                updateState(DAILY_FROM, new StringType(myObject.get("from").toString()));
+                updateState(DAILY_TO, new StringType(myObject.get("to").toString()));
 
-                String cost = myObject.get("cost").toString();
-                updateChannel(DAILY_COST, cost);
-
-                String consumption = myObject.get("consumption").toString();
-                updateChannel(DAILY_CONSUMPTION, consumption);
-
-                return;
+                updateChannel(DAILY_COST, myObject.get("cost").toString());
+                updateChannel(DAILY_CONSUMPTION, myObject.get("consumption").toString());
 
             } catch (JsonSyntaxException e) {
-                logger.error("JsonException: {}", e);
+                updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.COMMUNICATION_ERROR,
+                        "Error communicating with Tibber API");
             }
         } else if (jsonResponse.contains("error")) {
             updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.COMMUNICATION_ERROR,
-                    "Error communicating with Tibber API");
-            return;
+                    "Error in response from Tibber API");
 
         } else {
-            logger.debug("Unexpected response from Tibber: {}", jsonResponse);
-            return;
+            updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.COMMUNICATION_ERROR, "Unexpected response from Tibber");
         }
+        return;
     }
 
     public void getURLHourly(String url) throws IOException {
@@ -222,42 +225,35 @@ public class TibberHandler extends BaseThingHandler {
                 JsonObject myObject = (JsonObject) Object.getAsJsonObject("data").getAsJsonObject("viewer")
                         .getAsJsonObject("home").getAsJsonObject("hourly").getAsJsonArray("nodes").get(0);
 
-                String hourlyFrom = myObject.get("from").toString();
-                String hourlyTo = myObject.get("to").toString();
-                updateState(HOURLY_FROM, new StringType(hourlyFrom));
-                updateState(HOURLY_TO, new StringType(hourlyTo));
+                updateState(HOURLY_FROM, new StringType(myObject.get("from").toString()));
+                updateState(HOURLY_TO, new StringType(myObject.get("to").toString()));
 
-                String cost = myObject.get("cost").toString();
-                updateChannel(HOURLY_COST, cost);
-
-                String consumption = myObject.get("consumption").toString();
-                updateChannel(HOURLY_CONSUMPTION, consumption);
-
-                return;
+                updateChannel(HOURLY_COST, myObject.get("cost").toString());
+                updateChannel(HOURLY_CONSUMPTION, myObject.get("consumption").toString());
 
             } catch (JsonSyntaxException e) {
-                logger.error("JsonException: {}", e);
+                updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.COMMUNICATION_ERROR,
+                        "Error communicating with Tibber API");
             }
         } else if (jsonResponse.contains("error")) {
             updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.COMMUNICATION_ERROR,
-                    "Error communicating with Tibber API");
-            return;
+                    "Error in response from Tibber API");
 
         } else {
-            logger.debug("Unexpected response from Tibber: {}", jsonResponse);
-            return;
+            updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.COMMUNICATION_ERROR, "Unexpected response from Tibber");
         }
+        return;
     }
 
-    public void startRefresh(int Refresh) {
+    public void startRefresh(int refresh) {
         if (pollingJob == null) {
             pollingJob = scheduler.scheduleWithFixedDelay(() -> {
                 try {
                     updateRequest();
                 } catch (IOException e) {
-                    logger.error("IO Exception: {}", e);
+                    logger.warn("IO Exception: ", e);
                 }
-            }, 1, Refresh, TimeUnit.MINUTES);
+            }, 1, refresh, TimeUnit.MINUTES);
         }
         return;
     }
@@ -267,29 +263,37 @@ public class TibberHandler extends BaseThingHandler {
         getURLDaily(BASE_URL);
         getURLHourly(BASE_URL);
 
-        if (rtEnabled.equals("true") && !isConnected()) {
+        if ("true".equals(rtEnabled) && !isConnected()) {
             try {
                 open();
             } catch (Exception e) {
-                logger.error("Exception: {}", e);
+                logger.warn("Exception: ", e);
             }
         }
-
         return;
     }
 
     public void updateChannel(String channelID, String channelValue) {
         if (!channelValue.contains("null")) {
-            BigDecimal state = new BigDecimal(channelValue);
-            updateState(channelID, new DecimalType(state));
-            return;
-        } else {
-            return;
+
+            if (channelID.contains("consumption") || channelID.contains("Consumption")
+                    || channelID.contains("accumulatedProduction")) {
+                updateState(channelID, new QuantityType<>(new BigDecimal(channelValue), SmartHomeUnits.KILOWATT_HOUR));
+            } else if (channelID.contains("power") || channelID.contains("Power")) {
+                updateState(channelID, new QuantityType<>(new BigDecimal(channelValue), SmartHomeUnits.WATT));
+            } else if (channelID.contains("voltage")) {
+                updateState(channelID, new QuantityType<>(new BigDecimal(channelValue), SmartHomeUnits.VOLT));
+            } else if (channelID.contains("live_current")) {
+                updateState(channelID, new QuantityType<>(new BigDecimal(channelValue), SmartHomeUnits.AMPERE));
+            } else {
+                updateState(channelID, new DecimalType(channelValue));
+            }
         }
+        return;
     }
 
     public void thingStatusChanged(ThingStatusInfo thingStatusInfo) {
-        logger.warn("Thing Status updated to {} for device: {}", thingStatusInfo.getStatus(), getThing().getUID());
+        logger.debug("Thing Status updated to {} for device: {}", thingStatusInfo.getStatus(), getThing().getUID());
         if (thingStatusInfo.getStatus() != ThingStatus.ONLINE) {
             updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.COMMUNICATION_ERROR,
                     "Unable to communicate with Tibber API");
@@ -300,6 +304,7 @@ public class TibberHandler extends BaseThingHandler {
     public void dispose() {
         if (pollingJob != null) {
             pollingJob.cancel(true);
+            pollingJob = null;
         }
         if (isConnected()) {
             close();
@@ -309,11 +314,10 @@ public class TibberHandler extends BaseThingHandler {
 
     public void open() throws Exception {
         if (isConnected()) {
-            logger.warn("Open: connection is already open");
+            logger.debug("Open: connection is already open");
         }
         logger.info("Connecting to: {}", SUBSCRIPTION_URL);
 
-        sslContextFactory = new SslContextFactory(true);
         sslContextFactory.setTrustAll(true);
         sslContextFactory.setEndpointIdentificationAlgorithm(null);
 
@@ -337,7 +341,7 @@ public class TibberHandler extends BaseThingHandler {
             try {
                 socket.sendMessage(disconnect);
             } catch (IOException e) {
-                logger.error("Closing websocket stream");
+                logger.warn("Closing websocket stream");
             }
             session.close();
             session = null;
@@ -365,7 +369,7 @@ public class TibberHandler extends BaseThingHandler {
             try {
                 sendMessage(connection);
             } catch (IOException e) {
-                logger.error("Send Message Exception: ", e);
+                logger.warn("Send Message Exception: ", e);
             }
         }
 
@@ -394,80 +398,61 @@ public class TibberHandler extends BaseThingHandler {
                 JsonObject myObject = Object.getAsJsonObject("payload").getAsJsonObject("data")
                         .getAsJsonObject("liveMeasurement");
                 if (message.contains("timestamp")) {
-                    String timestamp = myObject.get("timestamp").toString();
-                    updateState(LIVE_TIMESTAMP, new StringType(timestamp));
+                    updateState(LIVE_TIMESTAMP, new StringType(myObject.get("timestamp").toString()));
                 }
                 if (message.contains("power")) {
-                    String power = myObject.get("power").toString();
-                    updateChannel(LIVE_POWER, power);
+                    updateChannel(LIVE_POWER, myObject.get("power").toString());
                 }
                 if (message.contains("lastMeterConsumption")) {
-                    String lastMeterConsumption = myObject.get("lastMeterConsumption").toString();
-                    updateChannel(LIVE_LASTMETERCONSUMPTION, lastMeterConsumption);
+                    updateChannel(LIVE_LASTMETERCONSUMPTION, myObject.get("lastMeterConsumption").toString());
                 }
                 if (message.contains("accumulatedConsumption")) {
-                    String accumulatedConsumption = myObject.get("accumulatedConsumption").toString();
-                    updateChannel(LIVE_ACCUMULATEDCONSUMPTION, accumulatedConsumption);
+                    updateChannel(LIVE_ACCUMULATEDCONSUMPTION, myObject.get("accumulatedConsumption").toString());
                 }
                 if (message.contains("accumulatedCost")) {
-                    String accumulatedCost = myObject.get("accumulatedCost").toString();
-                    updateChannel(LIVE_ACCUMULATEDCOST, accumulatedCost);
+                    updateChannel(LIVE_ACCUMULATEDCOST, myObject.get("accumulatedCost").toString());
                 }
                 if (message.contains("currency")) {
-                    String currency = myObject.get("currency").toString();
-                    updateState(LIVE_CURRENCY, new StringType(currency));
+                    updateState(LIVE_CURRENCY, new StringType(myObject.get("currency").toString()));
                 }
                 if (message.contains("minPower")) {
-                    String minpower = myObject.get("minPower").toString();
-                    updateChannel(LIVE_MINPOWER, minpower);
+                    updateChannel(LIVE_MINPOWER, myObject.get("minPower").toString());
                 }
                 if (message.contains("averagePower")) {
-                    String averagepower = myObject.get("averagePower").toString();
-                    updateChannel(LIVE_AVERAGEPOWER, averagepower);
+                    updateChannel(LIVE_AVERAGEPOWER, myObject.get("averagePower").toString());
                 }
                 if (message.contains("maxPower")) {
-                    String maxpower = myObject.get("maxPower").toString();
-                    updateChannel(LIVE_MAXPOWER, maxpower);
+                    updateChannel(LIVE_MAXPOWER, myObject.get("maxPower").toString());
                 }
                 if (message.contains("voltagePhase1")) {
-                    String voltage1 = myObject.get("voltagePhase1").toString();
-                    updateChannel(LIVE_VOLTAGE1, voltage1);
+                    updateChannel(LIVE_VOLTAGE1, myObject.get("voltagePhase1").toString());
                 }
                 if (message.contains("voltagePhase2")) {
-                    String voltage2 = myObject.get("voltagePhase2").toString();
-                    updateChannel(LIVE_VOLTAGE2, voltage2);
+                    updateChannel(LIVE_VOLTAGE2, myObject.get("voltagePhase2").toString());
                 }
                 if (message.contains("voltagePhase3")) {
-                    String voltage3 = myObject.get("voltagePhase3").toString();
-                    updateChannel(LIVE_VOLTAGE3, voltage3);
+                    updateChannel(LIVE_VOLTAGE3, myObject.get("voltagePhase3").toString());
                 }
                 if (message.contains("currentPhase1")) {
-                    String current1 = myObject.get("currentPhase1").toString();
-                    updateChannel(LIVE_CURRENT1, current1);
+                    updateChannel(LIVE_CURRENT1, myObject.get("currentPhase1").toString());
                 }
                 if (message.contains("currentPhase2")) {
-                    String current2 = myObject.get("currentPhase2").toString();
-                    updateChannel(LIVE_CURRENT2, current2);
+                    updateChannel(LIVE_CURRENT2, myObject.get("currentPhase2").toString());
                 }
                 if (message.contains("currentPhase3")) {
-                    String current3 = myObject.get("currentPhase3").toString();
-                    updateChannel(LIVE_CURRENT3, current3);
+                    updateChannel(LIVE_CURRENT3, myObject.get("currentPhase3").toString());
                 }
                 if (message.contains("powerProduction")) {
-                    String production = myObject.get("powerProduction").toString();
-                    updateChannel(LIVE_POWERPRODUCTION, production);
+                    updateChannel(LIVE_POWERPRODUCTION, myObject.get("powerProduction").toString());
                 }
                 if (message.contains("accumulatedProduction")) {
-                    String accumulatedProduction = myObject.get("accumulatedProduction").toString();
-                    updateChannel(LIVE_ACCUMULATEDPRODUCTION, accumulatedProduction);
+                    updateChannel(LIVE_ACCUMULATEDPRODUCTION, myObject.get("accumulatedProduction").toString());
                 }
                 if (message.contains("minPowerProduction")) {
-                    String minpowerproduction = myObject.get("minPowerProduction").toString();
-                    updateChannel(LIVE_MINPOWERPRODUCTION, minpowerproduction);
+                    updateChannel(LIVE_MINPOWERPRODUCTION, myObject.get("minPowerProduction").toString());
                 }
                 if (message.contains("maxPowerProduction")) {
-                    String maxpowerproduction = myObject.get("maxPowerProduction").toString();
-                    updateChannel(LIVE_MAXPOWERPRODUCTION, maxpowerproduction);
+                    updateChannel(LIVE_MAXPOWERPRODUCTION, myObject.get("maxPowerProduction").toString());
                 }
             } else {
                 logger.debug("Unknown live response from Tibber");
@@ -485,18 +470,16 @@ public class TibberHandler extends BaseThingHandler {
 
         public void onWebSocketText(String message) {
             logger.debug("WebSocketText('{}')", message);
-
         }
 
         public void startSubscription() {
-
             String query = "{\"id\":\"1\",\"type\":\"start\",\"payload\":{\"variables\":{},\"extensions\":{},\"operationName\":null,\"query\":\"subscription {\\n liveMeasurement(homeId:\\\""
                     + configuration.getHomeid()
                     + "\\\") {\\n timestamp\\n power\\n lastMeterConsumption\\n accumulatedConsumption\\n accumulatedCost\\n currency\\n minPower\\n averagePower\\n maxPower\\n voltagePhase1\\n voltagePhase2\\n voltagePhase3\\n currentPhase1\\n currentPhase2\\n currentPhase3\\n powerProduction\\n accumulatedProduction\\n minPowerProduction\\n maxPowerProduction\\n }\\n }\\n\"}}";
             try {
                 sendMessage(query);
             } catch (IOException e) {
-                logger.error("Send Message Exception: ", e);
+                logger.warn("Send Message Exception: ", e);
             }
         }
     }
